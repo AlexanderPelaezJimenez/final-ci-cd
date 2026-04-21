@@ -76,7 +76,7 @@ boston_house_pricing/
 
 **1. Clonar el repositorio**
 ```bash
-git clone <url-del-repositorio>
+git clone https://github.com/AlexanderPelaezJimenez/final-ci-cd.git
 cd boston_house_pricing
 ```
 
@@ -245,4 +245,4 @@ Job 7: smoke-test-prod     ← pytest tests/test_smoke_app.py (contra prod ALB)
 
 ---
 
-## Universidad EAFIT · Materia CI/CD · 2025
+## Universidad EAFIT · Materia CI/CD · 2026
