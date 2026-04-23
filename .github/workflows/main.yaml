@@ -103,3 +103,256 @@ jobs:
         run: |
           echo "repo_name=${{ github.event.repository.name }}" >> $GITHUB_OUTPUT
           echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+  # ─────────────────────────────────────────────────────────────
+  # Job 2: Deploy Terraform Staging
+  # ─────────────────────────────────────────────────────────────
+  deploy-tf-staging:
+    needs: build-test-publish
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      alb_url_staging: ${{ steps.get_tf_outputs.outputs.alb_url }}
+      cluster_name_staging: "boston-staging-cluster"
+      service_name_staging: "boston-staging-service"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Ensure Terraform State Bucket
+        run: |
+          if aws s3api head-bucket --bucket "${{ vars.TF_STATE_BUCKET }}" 2>/dev/null; then
+            echo "Bucket de estado ya existe."
+          else
+            aws s3api create-bucket --bucket "${{ vars.TF_STATE_BUCKET }}" --region us-east-1
+          fi
+          aws s3api put-bucket-versioning \
+            --bucket "${{ vars.TF_STATE_BUCKET }}" \
+            --versioning-configuration Status=Enabled
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+          terraform_wrapper: false
+
+      - name: Terraform Init (Staging)
+        working-directory: infra
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=staging/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+
+      - name: Terraform Apply (Staging)
+        working-directory: infra
+        env:
+          TF_VAR_environment_name: staging
+          TF_VAR_lab_role_arn: ${{ vars.LAB_ROLE_ARN }}
+          TF_VAR_vpc_id: ${{ vars.VPC_ID }}
+          TF_VAR_secret_key: ${{ secrets.SECRET_KEY }}
+        run: |
+          IMAGE_URI="${{ vars.DOCKERHUB_USERNAME }}/${{ needs.build-test-publish.outputs.repo_name }}:${{ needs.build-test-publish.outputs.image_tag }}"
+          SUBNET_LIST=$(echo "${{ vars.SUBNET_IDS }}" | \
+            awk -F',' '{printf "["; for(i=1;i<=NF;i++){printf "\"%s\"%s",$i,(i<NF?",":"")}; printf "]"}')
+          terraform apply -auto-approve \
+            -var="docker_image_uri=${IMAGE_URI}" \
+            -var="subnet_ids=${SUBNET_LIST}"
+
+      - name: Get Terraform Outputs (Staging)
+        id: get_tf_outputs
+        working-directory: infra
+        run: |
+          ALB_URL=$(terraform output -raw alb_url)
+          echo "alb_url=${ALB_URL}" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────────────────────
+  # Job 3: Forzar despliegue en ECS Staging
+  # ─────────────────────────────────────────────────────────────
+  update-service-staging:
+    needs: [build-test-publish, deploy-tf-staging]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Force New Deployment ECS Staging
+        run: |
+          aws ecs update-service \
+            --cluster ${{ needs.deploy-tf-staging.outputs.cluster_name_staging }} \
+            --service ${{ needs.deploy-tf-staging.outputs.service_name_staging }} \
+            --force-new-deployment \
+            --region us-east-1
+          aws ecs wait services-stable \
+            --cluster ${{ needs.deploy-tf-staging.outputs.cluster_name_staging }} \
+            --services ${{ needs.deploy-tf-staging.outputs.service_name_staging }} \
+            --region us-east-1
+
+  # ─────────────────────────────────────────────────────────────
+  # Job 4: Pruebas de aceptación en Staging
+  # ─────────────────────────────────────────────────────────────
+  test-staging:
+    needs: [update-service-staging, deploy-tf-staging]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Acceptance Tests against Staging
+        env:
+          APP_BASE_URL: ${{ needs.deploy-tf-staging.outputs.alb_url_staging }}
+        run: |
+          sleep 30
+          pytest tests/test_acceptance_app.py
+
+  # ─────────────────────────────────────────────────────────────
+  # Job 5: Deploy Terraform Producción (solo si staging pasó)
+  # ─────────────────────────────────────────────────────────────
+  deploy-tf-prod:
+    needs: [build-test-publish, test-staging]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      alb_url_prod: ${{ steps.get_tf_outputs.outputs.alb_url }}
+      cluster_name_prod: "boston-production-cluster"
+      service_name_prod: "boston-production-service"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Ensure Terraform State Bucket
+        run: |
+          if aws s3api head-bucket --bucket "${{ vars.TF_STATE_BUCKET }}" 2>/dev/null; then
+            echo "Bucket ya existe."
+          else
+            aws s3api create-bucket --bucket "${{ vars.TF_STATE_BUCKET }}" --region us-east-1
+          fi
+          aws s3api put-bucket-versioning \
+            --bucket "${{ vars.TF_STATE_BUCKET }}" \
+            --versioning-configuration Status=Enabled
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+          terraform_wrapper: false
+
+      - name: Terraform Init (Production)
+        working-directory: infra
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=production/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+
+      - name: Terraform Apply (Production)
+        working-directory: infra
+        env:
+          TF_VAR_environment_name: production
+          TF_VAR_lab_role_arn: ${{ vars.LAB_ROLE_ARN }}
+          TF_VAR_vpc_id: ${{ vars.VPC_ID }}
+          TF_VAR_secret_key: ${{ secrets.SECRET_KEY }}
+        run: |
+          IMAGE_URI="${{ vars.DOCKERHUB_USERNAME }}/${{ needs.build-test-publish.outputs.repo_name }}:${{ needs.build-test-publish.outputs.image_tag }}"
+          SUBNET_LIST=$(echo "${{ vars.SUBNET_IDS }}" | \
+            awk -F',' '{printf "["; for(i=1;i<=NF;i++){printf "\"%s\"%s",$i,(i<NF?",":"")}; printf "]"}')
+          terraform apply -auto-approve \
+            -var="docker_image_uri=${IMAGE_URI}" \
+            -var="subnet_ids=${SUBNET_LIST}"
+
+      - name: Get Terraform Outputs (Production)
+        id: get_tf_outputs
+        working-directory: infra
+        run: |
+          ALB_URL=$(terraform output -raw alb_url)
+          echo "alb_url=${ALB_URL}" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────────────────────
+  # Job 6: Forzar despliegue en ECS Producción
+  # ─────────────────────────────────────────────────────────────
+  update-service-prod:
+    needs: [build-test-publish, deploy-tf-prod]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Force New Deployment ECS Production
+        run: |
+          aws ecs update-service \
+            --cluster ${{ needs.deploy-tf-prod.outputs.cluster_name_prod }} \
+            --service ${{ needs.deploy-tf-prod.outputs.service_name_prod }} \
+            --force-new-deployment \
+            --region us-east-1
+          aws ecs wait services-stable \
+            --cluster ${{ needs.deploy-tf-prod.outputs.cluster_name_prod }} \
+            --services ${{ needs.deploy-tf-prod.outputs.service_name_prod }} \
+            --region us-east-1
+
+  # ─────────────────────────────────────────────────────────────
+  # Job 7: Pruebas de humo en Producción
+  # ─────────────────────────────────────────────────────────────
+  smoke-test-prod:
+    needs: [update-service-prod, deploy-tf-prod]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Smoke Tests against Production
+        env:
+          APP_BASE_URL: ${{ needs.deploy-tf-prod.outputs.alb_url_prod }}
+        run: |
+          sleep 30
+          pytest tests/test_smoke_app.py
