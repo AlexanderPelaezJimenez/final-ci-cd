@@ -59,11 +59,11 @@ def test_prediction_result_appears(browser):
     browser.get(BASE_URL + "/")
     _fill_and_submit(browser, _SAMPLE_INPUT)
     try:
-        WebDriverWait(browser, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".result-card"))
+        element = WebDriverWait(browser, 10).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, ".result-card"))
         )
-        result_text = browser.find_element(By.CSS_SELECTOR, ".result-card").text
-        assert "$" in result_text or "32" in result_text
+        result_text = element.text
+        assert "$" in result_text
     except TimeoutException as exc:
         raise AssertionError(
             "Result card did not appear after form submission."
