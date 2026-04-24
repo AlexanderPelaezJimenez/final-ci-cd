@@ -466,9 +466,8 @@ jobs:
         id: prev_version
         run: |
           git fetch --tags
-          PREV=$(git tag --sort=-version:refname | grep '^v' | head -2 | tail -1)
-          CURRENT="${{ needs.build-test-publish.outputs.image_tag }}"
-          if [ -z "$PREV" ] || [ "$PREV" = "$CURRENT" ]; then
+          PREV=$(git tag --sort=-version:refname | grep '^v' | head -1)
+          if [ -z "$PREV" ]; then
             echo "No previous version found — first deploy, cannot roll back."
             echo "feasible=false" >> $GITHUB_OUTPUT
           else
