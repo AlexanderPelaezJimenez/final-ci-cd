@@ -21,6 +21,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Compute next semver version
+        id: semver
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          git fetch --tags
+          LATEST=$(git tag --sort=-version:refname | grep '^v' | head -1)
+          if [ -z "$LATEST" ]; then
+            LATEST="v0.0.0"
+          fi
+          MAJOR=$(echo "$LATEST" | cut -d. -f1 | tr -d 'v')
+          MINOR=$(echo "$LATEST" | cut -d. -f2)
+          PATCH=$(echo "$LATEST" | cut -d. -f3)
+          VERSION="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Next version: ${VERSION}"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -92,6 +108,7 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:${{ steps.semver.outputs.version }}
             ${{ vars.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:${{ github.sha }}
             ${{ vars.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest
           cache-from: type=gha
@@ -102,7 +119,16 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           echo "repo_name=${{ github.event.repository.name }}" >> $GITHUB_OUTPUT
-          echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "image_tag=${{ steps.semver.outputs.version }}" >> $GITHUB_OUTPUT
+
+      - name: Push semver git tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.semver.outputs.version }}" -m "Release ${{ steps.semver.outputs.version }}"
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }} \
+            "${{ steps.semver.outputs.version }}"
   # ─────────────────────────────────────────────────────────────
   # Job 2: Deploy Terraform Staging
   # ─────────────────────────────────────────────────────────────
@@ -410,3 +436,115 @@ jobs:
         run: |
           sleep 30
           pytest tests/test_smoke_app.py
+
+  # ─────────────────────────────────────────────────────────────
+  # Job 8: Rollback Production if Smoke Tests Failed
+  # ─────────────────────────────────────────────────────────────
+  rollback-prod:
+    needs: [build-test-publish, deploy-tf-prod, update-service-prod, smoke-test-prod]
+    runs-on: ubuntu-latest
+    if: |
+      always() &&
+      needs.deploy-tf-prod.result == 'success' &&
+      needs.update-service-prod.result == 'success' &&
+      needs.smoke-test-prod.result == 'failure'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Find previous semver version
+        id: prev_version
+        run: |
+          git fetch --tags
+          PREV=$(git tag --sort=-version:refname | grep '^v' | head -2 | tail -1)
+          CURRENT="${{ needs.build-test-publish.outputs.image_tag }}"
+          if [ -z "$PREV" ] || [ "$PREV" = "$CURRENT" ]; then
+            echo "No previous version found — first deploy, cannot roll back."
+            echo "feasible=false" >> $GITHUB_OUTPUT
+          else
+            echo "Previous version: $PREV"
+            echo "prev=$PREV" >> $GITHUB_OUTPUT
+            echo "feasible=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Terraform
+        if: steps.prev_version.outputs.feasible == 'true'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+          terraform_wrapper: false
+
+      - name: Terraform Init (Production)
+        if: steps.prev_version.outputs.feasible == 'true'
+        working-directory: infra
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=final-ci-cd/production/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+
+      - name: Terraform Apply (Rollback to previous version)
+        if: steps.prev_version.outputs.feasible == 'true'
+        working-directory: infra
+        env:
+          TF_VAR_environment_name: production
+          TF_VAR_lab_role_arn: ${{ vars.LAB_ROLE_ARN }}
+          TF_VAR_vpc_id: ${{ vars.VPC_ID }}
+          TF_VAR_secret_key: ${{ secrets.SECRET_KEY }}
+        run: |
+          PREV_IMAGE="${{ vars.DOCKERHUB_USERNAME }}/${{ needs.build-test-publish.outputs.repo_name }}:${{ steps.prev_version.outputs.prev }}"
+          SUBNET_LIST=$(echo "${{ vars.SUBNET_IDS }}" | \
+            awk -F',' '{printf "["; for(i=1;i<=NF;i++){printf "\"%s\"%s",$i,(i<NF?",":"")}; printf "]"}')
+          terraform apply -auto-approve \
+            -var="docker_image_uri=${PREV_IMAGE}" \
+            -var="subnet_ids=${SUBNET_LIST}"
+
+      - name: Wait for service stable
+        if: steps.prev_version.outputs.feasible == 'true'
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ needs.deploy-tf-prod.outputs.cluster_name_prod }} \
+            --services ${{ needs.deploy-tf-prod.outputs.service_name_prod }} \
+            --region us-east-1
+
+      - name: Set up Python
+        if: steps.prev_version.outputs.feasible == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        if: steps.prev_version.outputs.feasible == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Confirm rollback with smoke tests
+        if: steps.prev_version.outputs.feasible == 'true'
+        env:
+          APP_BASE_URL: ${{ needs.deploy-tf-prod.outputs.alb_url_prod }}
+        run: |
+          sleep 30
+          pytest tests/test_smoke_app.py
+
+      - name: Write rollback summary
+        if: always()
+        run: |
+          FEASIBLE="${{ steps.prev_version.outputs.feasible }}"
+          echo "## Production Rollback Report" >> $GITHUB_STEP_SUMMARY
+          echo "**Failed deploy:** \`${{ needs.build-test-publish.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ "$FEASIBLE" != "true" ]; then
+            echo "**Status: NO ROLLBACK** — first deploy, no prior version exists. Manual intervention required." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Rolled back to:** \`${{ steps.prev_version.outputs.prev }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "Terraform state updated — no drift." >> $GITHUB_STEP_SUMMARY
+          fi
