@@ -234,6 +234,34 @@ jobs:
           sleep 30
           pytest tests/test_acceptance_app.py
 
+      - name: Run Locust Performance Tests against Staging
+        env:
+          APP_BASE_URL: ${{ needs.deploy-tf-staging.outputs.alb_url_staging }}
+        run: |
+          locust \
+            --headless \
+            --host "$APP_BASE_URL" \
+            --users 20 \
+            --spawn-rate 20 \
+            --run-time 1m \
+            --locustfile tests/locustfile.py \
+            --html locust-report.html \
+            --csv locust-report \
+            --exit-code-on-error 1 \
+            --percentile 95
+
+      - name: Check Performance Thresholds
+        run: python tests/check_locust_results.py
+
+      - name: Upload Locust Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: locust-performance-report
+          path: |
+            locust-report.html
+            locust-report_stats.csv
+
   # ─────────────────────────────────────────────────────────────
   # Job 5: Deploy Terraform Producción (solo si staging pasó)
   # ─────────────────────────────────────────────────────────────
